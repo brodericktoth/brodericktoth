@@ -7,6 +7,205 @@ This guide shows a practical way to evolve a CLI task runner into a production-r
 - worker processes for execution,
 - and a shared core library reused by both CLI and workers.
 
+## 0) First step (the part most people get stuck on)
+
+If this felt abstract, start with this exact setup.
+
+Create **1 Rust workspace** with **4 projects (crates)**:
+
+1. `core` (library crate) — shared task types + execution logic.
+2. `cli` (binary crate) — your existing command-line app, now calling `core`.
+3. `api` (binary crate) — HTTP service that accepts jobs.
+4. `worker` (binary crate) — background process that executes queued jobs.
+
+### Minimum files to create right now
+
+You can begin with just **7 files**:
+
+1. `Cargo.toml` (workspace root)
+2. `crates/core/Cargo.toml`
+3. `crates/core/src/lib.rs`
+4. `crates/cli/Cargo.toml`
+5. `crates/cli/src/main.rs`
+6. `crates/api/Cargo.toml`
+7. `crates/worker/Cargo.toml`
+
+Then add these two when you are ready to run API/worker processes:
+
+- `crates/api/src/main.rs`
+- `crates/worker/src/main.rs`
+
+So:
+
+- **Day 1 scaffold only**: 7 files
+- **Runnable 4-crate baseline**: 9 files
+
+### What goes in each file (minimal)
+
+- `core/src/lib.rs`: define `TaskSpec`, `JobInput`, `JobOutput`, and `TaskExecutor` trait.
+- `cli/src/main.rs`: parse args and call `core` directly.
+- `api/src/main.rs`: expose `POST /jobs` + `GET /jobs/:id`.
+- `worker/src/main.rs`: poll queue, claim job, call `core`, update status.
+
+### Why this is step 1
+
+You’re not building everything at once. You’re only creating boundaries so the same task logic is reused by:
+
+- local CLI runs (`--local`), and
+- background worker runs (`--remote` via API + queue).
+
+If you do only this first step, you already avoid the biggest rewrite mistake: duplicating business logic in CLI and worker.
+
+
+## 0.1 Exact terminal walkthrough (copy/paste)
+
+If you are starting from scratch, run these commands from your repo root:
+
+```bash
+# 1) Create workspace folders
+mkdir -p crates
+
+# 2) Create crates
+cargo new crates/core --lib
+cargo new crates/cli --bin
+cargo new crates/api --bin
+cargo new crates/worker --bin
+
+# 3) Create/replace workspace Cargo.toml at repo root
+cat > Cargo.toml <<'EOF'
+[workspace]
+members = [
+  "crates/core",
+  "crates/cli",
+  "crates/api",
+  "crates/worker"
+]
+resolver = "2"
+EOF
+
+# 4) Verify the workspace compiles
+cargo check
+```
+
+### Do I install crates with terminal or just import in files?
+
+Both, but in Rust that means **adding dependencies in each crate's `Cargo.toml`**, then importing in code.
+
+- You can edit `Cargo.toml` manually, or
+- use terminal helpers like `cargo add serde --features derive`.
+
+You **do not** install crates globally like `npm -g`. Dependencies are project-local per crate.
+
+### Minimal dependency set per crate
+
+`crates/core/Cargo.toml`
+
+```toml
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+```
+
+`crates/cli/Cargo.toml`
+
+```toml
+[dependencies]
+core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+`crates/api/Cargo.toml`
+
+```toml
+[dependencies]
+core = { path = "../core" }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+```
+
+`crates/worker/Cargo.toml`
+
+```toml
+[dependencies]
+core = { path = "../core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+```
+
+## 0.2 Exactly how many files you should code in first
+
+For the first working milestone, focus on **10 files total**:
+
+1. `Cargo.toml` (workspace root)
+2. `crates/core/Cargo.toml`
+3. `crates/core/src/lib.rs`
+4. `crates/cli/Cargo.toml`
+5. `crates/cli/src/main.rs`
+6. `crates/api/Cargo.toml`
+7. `crates/api/src/main.rs`
+8. `crates/worker/Cargo.toml`
+9. `crates/worker/src/main.rs`
+10. `migrations/0001_create_jobs.sql`
+
+Everything else can wait.
+
+## 0.3 Copy code from task runner or import it?
+
+Short answer: **copy once, then import forever**.
+
+1. Copy your real task logic from current CLI into `core` (one-time move).
+2. Replace old CLI logic with a call into `core`.
+3. API and worker also call `core`.
+
+So after extraction:
+
+- `core` owns business logic,
+- `cli`, `api`, and `worker` only orchestrate.
+
+Avoid keeping duplicate task logic in both `cli` and `worker`.
+
+## 0.4 Function of each file you write
+
+- `Cargo.toml` (root): declares workspace members.
+- `core/src/lib.rs`: types + trait + task execution entrypoint.
+- `cli/src/main.rs`: parse command, build `TaskSpec`, call `core`.
+- `api/src/main.rs`: receive HTTP request, validate, insert `jobs` row.
+- `worker/src/main.rs`: claim queued jobs, call `core`, write status/result.
+- `migrations/0001_create_jobs.sql`: creates durable queue table.
+
+## 0.5 Concepts you are applying (and why)
+
+- **Separation of concerns**: transport (CLI/API) is separated from business logic (`core`).
+- **Single source of truth**: one executor path avoids drift/bugs.
+- **Durable queue**: DB keeps jobs safe across crashes/restarts.
+- **Idempotency**: same request key won’t execute side effects twice.
+- **At-least-once processing**: retries handle transient failures.
+- **Atomic claim**: `FOR UPDATE SKIP LOCKED` prevents duplicate workers on same job.
+
+## 0.6 First milestone checklist (what to finish now)
+
+- [ ] Workspace with 4 crates compiles.
+- [ ] `core` defines `TaskSpec`, `JobInput`, `JobOutput`, `TaskExecutor`.
+- [ ] CLI runs one real task through `core`.
+- [ ] Migration creates `jobs` table.
+- [ ] API can enqueue (`POST /jobs`).
+- [ ] Worker can claim + execute + mark success/failure.
+- [ ] `GET /jobs/:id` returns status.
+
+If these are done, you already have a real end-to-end system.
+
 ## 1) Target architecture
 
 Split into a Rust workspace:
